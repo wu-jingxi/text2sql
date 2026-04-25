@@ -1,0 +1,21 @@
+// 1. 获取图表实例 (保持不变)
+var dom = document.querySelector('[_echarts_instance_]');
+var chart = echarts.getInstanceByDom(dom);
+var option = chart.getOption();
+
+// 2. 【核心修改】直接通过 ID 精准获取产品名称
+// 这比任何 querySelector 都要稳定和快
+var productName = document.getElementById('shown-item-name').innerText.trim();
+
+// 3. 映射数据
+var stages = option.yAxis[0].data;
+var values = option.series[0].data;
+
+var result = stages.map((s, i) => ({
+  product: productName, 
+  stage: s,
+  emission: values[i].value
+}));
+
+console.log("抓取到的产品名：", productName);
+console.log("最终完整结果：", result);
