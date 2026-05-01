@@ -1,16 +1,35 @@
 import sqlite3
 import os
 from langchain_openai import ChatOpenAI
+import requests
+
 
 DASHSCOPE_API_KEY = "sk-648d3fd76f2e464d9b037c82d17df2dc" 
 
 # ===== 2. 初始化 LLM（统一用这个）=====
 llm = ChatOpenAI(
-    model="qwen-plus",
+    model="qwen3.5-flash",
     openai_api_key=DASHSCOPE_API_KEY,
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    temperature=0
+    temperature=0.2
 )
+
+
+def rerank_sql(question, candidates):
+    url = "http://localhost:8001/rerank"
+
+    payload = {
+        "query": question,
+        "docs": candidates
+    }
+
+    response = requests.post(url, json=payload)
+    print("🔥 reranker返回:", response.text)
+    data = response.json()
+
+    ranked = sorted(data["results"], key=lambda x: x["score"], reverse=True)
+
+    return ranked[0]["text"]
 
 # ===== 3. 数据库结构（给模型看的）=====
 SCHEMA = """
@@ -59,42 +78,23 @@ SQL查询语句：
     return response.content.strip()
 
 
-# ===== 6.5 AI生成最终答案 =====
-def generate_answer(question, sql, result):
-    prompt = f"""
-你是一个碳排放分析助手，请根据数据库查询结果回答用户问题。
 
-用户问题：
-{question}
-
-SQL查询语句：
-{sql}
-
-查询结果：
-{result}
-
-请给出最终回答，要求：
-1. 用自然语言回答（像人说话）
-2. 说明清楚产品、时间、地区（如果有）
-3. 数值要写清楚
-4. 如果有多个结果，请分别说明
-5. 如果结果为空，请说明未找到数据
-"""
-
-    response = llm.invoke(prompt)
-    return response.content.strip()
 
 
 # ===== 4. 生成 SQL =====
 def generate_sql(question):
     prompt = f"""
+
+
 你是一个SQLite专家，请根据用户问题生成SQL查询语句。
 
 数据库结构：
 {SCHEMA}
 
 要求：
+
 1. 只能写 SELECT 查询
+
 2. 必须使用 JOIN：
    FROM products p
    JOIN emissions e ON p.id = e.product_id
@@ -102,18 +102,53 @@ def generate_sql(question):
 3. 条件解析规则（非常重要）：
 - 如果问题中提到“年份”，使用 p.date
 - 如果提到“地区/国家/地方”，必须使用 p.region
-- 如果提到“产品名称”，使用 p.name
+- 如果提到产品名称：
+    默认使用 LIKE '%关键词%'
+    只有在完全匹配明确产品时才使用 =
 
 4. 聚合规则：
 - “总排放” → SUM(e.emission)
-- 如果查询涉及多个地区 → 必须 GROUP BY p.region
-- 如果已经明确指定地区 → 不需要 GROUP BY
+- 如果查询涉及多个地区 → GROUP BY p.region
+- 如果查询涉及多个产品 → GROUP BY p.name
+- 如果已经明确指定地区或产品 → 不需要 GROUP BY
 
-5. 所有字符串必须加引号，例如：
+5. 字段选择规则：
+- 如果问题问“碳排放是多少” → 返回 SUM(e.emission)
+- 如果问“来源/source” → 返回 DISTINCT p.source
+- 如果问“单位” → 返回 p.unit
+- 如果问“年份” → 返回 p.date
+
+6. 阶段（生命周期）规则：
+- 如果问题提到“阶段 / 过程 / 生命周期”
+  → 返回 e.stage, e.emission
+- 不要使用 SUM（除非明确要求总量）
+
+7. 比较与排序规则：
+- “哪个更高 / 最大” → ORDER BY SUM(e.emission) DESC LIMIT 1
+- “哪个更低 / 最小” → ORDER BY SUM(e.emission) ASC LIMIT 1
+
+8. Top-K规则：
+- “前N个” → LIMIT N
+
+9. 模糊查询规则：
+- 如果地区不具体（如“中国”）
+  → 使用 p.region LIKE '中国%'
+
+10. 多对象查询：
+- 如果问题涉及多个产品
+  → 使用 p.name IN ('A','B')
+
+11. 去重规则：
+- 如果查询非数值字段（如 source）
+  → 使用 DISTINCT
+
+12. 字符串必须加引号，例如：
    p.date = '2023'
    p.region = '中国云南'
 
-6. 只返回SQL，不要解释
+13. 只返回SQL，不要解释
+
+
 
 用户问题：
 {question}
@@ -128,6 +163,14 @@ def generate_sql(question):
 
     return sql
 
+def generate_sql_candidates(question, n=3):
+    sqls = []
+    for _ in range(n):
+        sql = generate_sql(question)  # 👉 复用你原来的函数
+        sqls.append(sql)
+
+    return list(set(sqls))  # 去重
+
 # ===== 5. 执行 SQL =====
 def run_sql(sql):
     conn = sqlite3.connect("text2sql/carbon.db")
@@ -136,26 +179,49 @@ def run_sql(sql):
     try:
         cursor.execute(sql)
         result = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
     except Exception as e:
         result = f"SQL执行错误: {e}"
+        columns = []
 
     conn.close()
-    return result
+    return result, columns
+
+def format_result(result, columns):
+    if isinstance(result, str):
+        return result
+
+    lines = []
+    for row in result:
+        line = ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
+        lines.append(line)
+
+    return "\n".join(lines)
 
 # ===== 6. 主流程 =====
 def ask(question):
     print(f"\n👤 问题: {question}")
 
     # 1. 生成SQL
-    sql = generate_sql(question)
-    print(f"\n🧠 生成SQL:\n{sql}")
+    # 1. 生成多个SQL
+    candidates = generate_sql_candidates(question)
+
+    print("\n🧠 SQL候选：")
+    for i, c in enumerate(candidates):
+        print(f"{i+1}. {c}")
+
+# 2. reranker选最优
+    sql = rerank_sql(question, candidates)
+
+    print(f"\n🏆 最优SQL:\n{sql}")
 
     # 2. 执行SQL
-    result = run_sql(sql)
-    print(f"\n📊 查询结果:\n{result}")
+    result, columns = run_sql(sql)
 
-    # 3. AI生成最终答案
-    answer = generate_answer(question, sql, result)
+    formatted = format_result(result, columns)
+
+    answer = generate_answer(question, sql, formatted)
+    print(f"\n📊 查询结果（格式化后）:\n{formatted}")
 
     print(f"\n🤖 AI回答:\n{answer}")
 
